@@ -1,0 +1,17 @@
+[package]
+name = "orbit-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "ORBIT core: scanning, persistent identity, relations, layout, search and SQLite store"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+libc.workspace = true
+thiserror.workspace = true
+blake3.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

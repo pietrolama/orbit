@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=ORBIT
+GenericName=Esploratore relazionale del filesystem
+Comment=Memoria spaziale e relazionale del filesystem, locale e privata
+Exec=orbit ui
+Icon=folder-saved-search
+Terminal=false
+Categories=Utility;FileTools;System;
+Keywords=file;filesystem;relazioni;ricerca;duplicati;storia;

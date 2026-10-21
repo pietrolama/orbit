@@ -1,0 +1,19 @@
+[package]
+name = "orbit-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "ORBIT desktop application: local API server and Canvas UI"
+
+[[bin]]
+name = "orbit-app"
+path = "src/main.rs"
+
+[dependencies]
+orbit-core = { path = "../orbit-core" }
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

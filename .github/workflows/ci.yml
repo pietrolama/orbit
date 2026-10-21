@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  verify:
+    name: fmt · clippy · test (Ubuntu)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust toolchain (stable + rustfmt + clippy)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Runtime libraries (SQLite is loaded with dlopen)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libsqlite3-0 coreutils
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Tests
+        run: cargo test --workspace
+
+      - name: UI unit tests (Node)
+        run: node --test crates/orbit-app/tests/ui_gravity.test.js
+
+      - name: Small synthetic benchmark (smoke)
+        run: cargo run --release -p orbit-cli -- bench --files 5000

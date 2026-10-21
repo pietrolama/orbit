@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="it">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ORBIT</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <header id="topbar">
+    <div class="brand" title="ORBIT — memoria spaziale e relazionale del filesystem">
+      <span class="brand-mark" aria-hidden="true"></span>ORBIT
+    </div>
+    <nav class="modes" role="tablist" aria-label="Modalità">
+      <button role="tab" data-mode="explore" class="active" aria-selected="true">Explore</button>
+      <button role="tab" data-mode="history" aria-selected="false">History</button>
+      <button role="tab" data-mode="recover" aria-selected="false">Recover</button>
+    </nav>
+    <div class="search">
+      <input id="search" type="search" placeholder="Cerca (es. fattura 2026, ext:pdf size:>10MB, modified:last-7d)" autocomplete="off" spellcheck="false" aria-label="Ricerca gravitazionale">
+      <span id="search-count" class="muted"></span>
+    </div>
+    <form id="scan-form" class="scan" autocomplete="off">
+      <input id="scan-path" type="text" placeholder="/percorso/da/esplorare" aria-label="Directory da scansionare" spellcheck="false">
+      <label class="check" title="Calcola l'hash completo dei candidati duplicati"><input id="scan-verify" type="checkbox"> verifica duplicati</label>
+      <button id="scan-start" type="submit" class="primary">Scansiona</button>
+      <button id="scan-cancel" type="button" class="hidden">Annulla</button>
+    </form>
+  </header>
+
+  <main id="stage">
+    <canvas id="canvas" aria-label="Spazio ORBIT"></canvas>
+
+    <div id="empty" class="overlay-msg hidden">
+      <h2>Nessuno spazio ancora</h2>
+      <p>Scegli una cartella in alto e premi <b>Scansiona</b>. ORBIT legge solo metadati e piccoli campioni, in locale.</p>
+    </div>
+
+    <div id="hud">
+      <div id="lod" class="pill" title="Livello di dettaglio">Galassia</div>
+      <div id="job" class="pill hidden"></div>
+      <div id="search-hint" class="pill accent hidden">Ricerca attiva — Esc per tornare alle posizioni originali</div>
+      <div id="link-hint" class="pill accent hidden">Modalità collegamento: clicca il file da collegare (Esc per annullare)</div>
+    </div>
+
+    <div id="filters" aria-label="Filtri relazioni"></div>
+
+    <div id="bottombar">
+      <nav id="breadcrumb" aria-label="Percorso fisico"></nav>
+      <div id="legend"></div>
+    </div>
+
+    <div id="selection-bar" class="hidden">
+      <span id="selection-count"></span>
+      <input id="constellation-name" type="text" maxlength="120" placeholder="Nome costellazione">
+      <button id="constellation-create" class="primary">Crea costellazione</button>
+      <button id="selection-clear">Deseleziona</button>
+    </div>
+
+    <aside id="panel" class="hidden" aria-label="Dettaglio">
+      <button id="panel-close" class="icon" title="Chiudi" aria-label="Chiudi">×</button>
+      <div id="panel-body"></div>
+    </aside>
+
+    <section id="sheet" class="hidden" aria-live="polite">
+      <div id="sheet-body"></div>
+    </section>
+
+    <div id="toasts" aria-live="polite"></div>
+  </main>
+
+  <script src="/renderer.js"></script>
+  <script src="/app.js"></script>
+</body>
+</html>
