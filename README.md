@@ -24,6 +24,7 @@ packaging/linux/install-local.sh
 ## Uso rapido
 
 ```bash
+orbit scan ~/projects                  # ogni sottocartella diventa un progetto (dipendenze e build saltate)
 orbit scan ~/Documenti                 # scansione + snapshot + relazioni + layout
 orbit scan ~/Documenti --verify-duplicates   # aggiunge l'hash completo dei candidati duplicati
 orbit search "fattura 2026"            # ricerca con motivazioni e vicini relazionali
@@ -53,6 +54,7 @@ Il database è in `$ORBIT_DB`, altrimenti `~/.local/share/orbit/orbit.db` (`--db
 
 ### Interfaccia
 
+- **Progetti**: la vista di partenza. Scegli un progetto e vedi solo il suo albero; attorno orbitano gli altri progetti (o cartelle) che contengono file collegati — riferimenti, duplicati, file identici — con una linea da ciascun file coinvolto. Seleziona un file o una cartella del progetto per evidenziare solo i suoi collegamenti; «deboli» mostra anche quelli basati solo su nomi simili o modifiche ravvicinate.
 - **Explore**: canvas con pan (trascina il vuoto), zoom (rotella), selezione (clic, Maiusc+clic per selezione multipla), trascinamento dei nodi (posizione manuale; le directory portano con sé i figli), pin, collegamenti manuali, costellazioni. Tre livelli: **Galassia** (cluster e flussi aggregati), **Sistema** (directory, file, relazioni forti, *satelliti* che vivono altrove), **File** (metadati, anteprima locale, relazioni spiegate, cronologia).
 - **Ricerca gravitazionale**: i risultati e i loro vicini vengono attratti verso il centro, il resto si attenua; `Esc` riporta tutto alle coordinate originali esatte. Nulla viene salvato.
 - **History**: confronto tra snapshot basato sulle identità (spostato ≠ eliminato + creato).

@@ -8,6 +8,7 @@
 //! - [`fingerprint`], [`references`], [`relations`]: sparse, explainable relation engine.
 //! - [`layout`]: deterministic, persistent, incremental spatial layout.
 //! - [`graph`]: in-memory read model and level-of-detail views (galaxy, system, file).
+//! - [`kinship`]: which projects look derived from, or built like, one another.
 //! - [`search`]: query parsing and ranking for the gravitational search.
 //! - [`history`]: entity-based snapshot comparison.
 //! - [`analyzer`]: scan helpers and the informative (non-destructive) space report.
@@ -19,6 +20,7 @@ pub mod graph;
 pub mod history;
 pub mod identity;
 pub mod index;
+pub mod kinship;
 pub mod layout;
 pub mod model;
 pub mod references;

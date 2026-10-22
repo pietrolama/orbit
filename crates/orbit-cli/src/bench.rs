@@ -351,6 +351,7 @@ fn run_inner(work: &Path, data: &Path, files: usize, json: bool) -> Result<(), S
         let cy = c.y;
         let span = (b[2] - b[0]).max(1.0) / 20.0;
         let q = RegionQuery {
+            within: None,
             x0: cx - span,
             y0: cy - span,
             x1: cx + span,

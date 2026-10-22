@@ -630,3 +630,60 @@ fn write_sized_file(path: &std::path::Path, size: usize) {
         file.write_all(&buf).expect("write test file");
     }
 }
+
+#[test]
+fn test_dependency_and_build_directories_are_excluded_by_name() {
+    let tmp = TempDir::new().expect("create tempdir");
+    let root = tmp.path();
+    for d in [
+        "app/node_modules/pkg",
+        "app/.git/objects",
+        "app/src",
+        "rust/target/debug",
+        "notes/target",
+    ] {
+        fs::create_dir_all(root.join(d)).unwrap();
+    }
+    for f in [
+        "app/node_modules/pkg/index.js",
+        "app/.git/objects/ab",
+        "app/src/main.js",
+        "rust/target/debug/bin",
+        "notes/target/goals.md",
+    ] {
+        File::create(root.join(f)).unwrap().write_all(b"x").unwrap();
+    }
+    File::create(root.join("rust/Cargo.toml")).unwrap();
+    // A virtualenv with an unusual name is recognised by its marker file.
+    fs::create_dir_all(root.join("app/.venv-gpu/lib")).unwrap();
+    File::create(root.join("app/.venv-gpu/pyvenv.cfg")).unwrap();
+    File::create(root.join("app/.venv-gpu/lib/site.py")).unwrap();
+
+    let res = scan_directory(&ScanConfig::new(root), &CancelToken::new());
+    assert_eq!(res.status, ScanStatus::Completed);
+    let status = |rel: &str| {
+        res.entries
+            .iter()
+            .find(|e| e.rel_path_display == rel)
+            .map(|e| e.access_status)
+    };
+    // Recorded, never traversed.
+    assert_eq!(
+        status("app/node_modules"),
+        Some(AccessStatus::ExcludedMount)
+    );
+    assert_eq!(status("app/.git"), Some(AccessStatus::ExcludedMount));
+    assert_eq!(status("app/node_modules/pkg/index.js"), None);
+    assert_eq!(status("rust/target"), Some(AccessStatus::ExcludedMount));
+    assert_eq!(status("app/.venv-gpu"), Some(AccessStatus::ExcludedMount));
+    // "target" without a Cargo.toml next to it is an ordinary folder.
+    assert_eq!(status("notes/target/goals.md"), Some(AccessStatus::Ok));
+    assert_eq!(status("app/src/main.js"), Some(AccessStatus::Ok));
+    // Files: main.js, goals.md, Cargo.toml.
+    assert_eq!(res.total_files_count, 3);
+
+    let mut all = ScanConfig::new(root);
+    all.excluded_names.clear();
+    let res = scan_directory(&all, &CancelToken::new());
+    assert_eq!(res.total_files_count, 8);
+}

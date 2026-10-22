@@ -10,6 +10,7 @@
 //! * **File** ([`Graph::entity_detail`]): one entity with metadata, history, and explained relations.
 
 use crate::identity::is_within_raw;
+use crate::kinship::{project_kinship, ProjectKin};
 use crate::layout::{NodePosition, PositionSource};
 use crate::model::{
     Edge, EdgeOrigin, EdgeState, EntityId, EntityState, EntryType, GraphNode, RelationKind,
@@ -32,6 +33,9 @@ pub struct Graph {
     membership: HashMap<EntityId, Vec<i64>>,
     /// Latest mtime in each subtree (directories) or own mtime (files).
     recent: HashMap<EntityId, i64>,
+    /// Project of every node: its ancestor directly under a scan root (the root itself for roots
+    /// and for nodes outside any project).
+    project_of: HashMap<EntityId, EntityId>,
     cfg: RelationConfig,
 }
 
@@ -127,6 +131,9 @@ pub struct OverviewView {
 /// Viewport query.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RegionQuery {
+    /// Only nodes inside this entity's subtree (project mode).
+    #[serde(default)]
+    pub within: Option<EntityId>,
     pub x0: f64,
     pub y0: f64,
     pub x1: f64,
@@ -232,6 +239,84 @@ pub struct FingerprintInfo {
     pub full_hash: Option<String>,
     pub valid_for_current_version: bool,
 }
+
+/// A project: a directory directly under a scan root (e.g. `~/projects/<name>`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProjectSummary {
+    pub id: EntityId,
+    pub name: String,
+    pub path: String,
+    pub files: u64,
+    pub bytes: u64,
+    pub recent_mtime: Option<i64>,
+    /// Entities outside the project related to something inside it (relations above the
+    /// threshold of the query).
+    pub external_links: usize,
+    /// Distinct other projects reached by those relations.
+    pub linked_projects: usize,
+    /// Projects that look derived from, or built like, this one (see [`crate::kinship`]).
+    pub relatives: Vec<Relative>,
+}
+
+/// A related project, from the point of view of another one.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Relative {
+    pub id: EntityId,
+    pub name: String,
+    pub path: String,
+    pub score: f64,
+    pub vocabulary: f64,
+    pub shared: Vec<String>,
+    pub name_root: Option<String>,
+    /// `Some(true)` if the relative came first, `Some(false)` if it came after, `None` if unclear.
+    pub came_first: Option<bool>,
+}
+
+/// Default threshold of project kinship (see [`crate::kinship`]).
+pub const KINSHIP_MIN_SCORE: f64 = 0.5;
+
+/// An entity outside a project that is related to entities inside it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProjectLink {
+    pub entity_id: EntityId,
+    pub name: String,
+    pub path: String,
+    pub kind: EntryType,
+    /// Strongest combined score over the inside entities it is related to.
+    pub score: f64,
+    pub kinds: Vec<RelationKind>,
+    /// Inside entities it is related to, strongest first (at most 32).
+    pub via: Vec<EntityId>,
+}
+
+/// External links of a project grouped by where they live: another project, or a directory
+/// outside every project.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LinkGroup {
+    pub id: EntityId,
+    pub name: String,
+    pub path: String,
+    pub is_project: bool,
+    pub score: f64,
+    pub links: Vec<ProjectLink>,
+}
+
+/// Project mode: the project's root and its relations with the rest of the space.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProjectView {
+    pub root: NodeView,
+    pub breadcrumb: Vec<Breadcrumb>,
+    pub groups: Vec<LinkGroup>,
+    /// External entities above the threshold, before the `limit` cap.
+    pub total_links: usize,
+    /// Pairs dropped because their score is below `min_score` (shown with a lower threshold).
+    pub weak_links: usize,
+    /// Projects that look derived from, or built like, this one.
+    pub relatives: Vec<Relative>,
+}
+
+/// Combined score and relation kinds of each (inside, outside) pair of a project.
+type PairScores = BTreeMap<(EntityId, EntityId), (f64, Vec<RelationKind>)>;
 
 /// Kind of local preview the UI may request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -346,6 +431,40 @@ impl Graph {
                 *e = (*e).max(cur);
             }
         }
+        // Project of every node (memoised walk up to the child of a root).
+        let mut project_of: HashMap<EntityId, EntityId> = HashMap::new();
+        for n in &nodes {
+            let mut path = Vec::new();
+            let mut cur = n.entity_id;
+            let project = loop {
+                if let Some(&p) = project_of.get(&cur) {
+                    break p;
+                }
+                let parent = nodes[index[&cur]]
+                    .parent_entity_id
+                    .filter(|p| index.contains_key(p) && *p != cur);
+                match parent {
+                    None => break cur,
+                    Some(p) => {
+                        let grand = nodes[index[&p]]
+                            .parent_entity_id
+                            .filter(|g| index.contains_key(g) && *g != p);
+                        if grand.is_none() {
+                            break cur;
+                        }
+                        path.push(cur);
+                        cur = p;
+                        if path.len() > 4096 {
+                            break cur;
+                        }
+                    }
+                }
+            };
+            project_of.insert(cur, project);
+            for c in path {
+                project_of.insert(c, project);
+            }
+        }
         Self {
             nodes,
             index,
@@ -356,6 +475,7 @@ impl Graph {
             constellations,
             membership,
             recent,
+            project_of,
             cfg,
         }
     }
@@ -557,8 +677,22 @@ impl Graph {
     /// Galaxy view: splits the largest clusters (by file count) until `max_clusters` is reached,
     /// then aggregates relations between clusters into at most `max_flows` flows.
     pub fn overview(&self, max_clusters: usize, max_flows: usize) -> OverviewView {
+        self.overview_within(max_clusters, max_flows, None)
+    }
+
+    /// [`Graph::overview`] restricted to the subtree of `within` (project mode): clusters, flows,
+    /// bounds and totals only cover that subtree.
+    pub fn overview_within(
+        &self,
+        max_clusters: usize,
+        max_flows: usize,
+        within: Option<EntityId>,
+    ) -> OverviewView {
         let max_clusters = max_clusters.clamp(1, 2000);
-        let roots: Vec<EntityId> = {
+        let within = within.and_then(|w| self.node(w));
+        let roots: Vec<EntityId> = if let Some(w) = within {
+            vec![w.entity_id]
+        } else {
             let mut r: Vec<EntityId> = self
                 .nodes
                 .iter()
@@ -637,8 +771,11 @@ impl Graph {
         let mut rel_count: HashMap<EntityId, usize> = HashMap::new();
         let mut edges_by_kind: BTreeMap<String, usize> = BTreeMap::new();
         for e in &self.edges {
-            *edges_by_kind.entry(e.kind.as_db().to_string()).or_default() += 1;
-            let (Some(&ca), Some(&cb)) = (cluster_of.get(&e.src), cluster_of.get(&e.dst)) else {
+            let (ca, cb) = (cluster_of.get(&e.src), cluster_of.get(&e.dst));
+            if within.is_none() || (ca.is_some() && cb.is_some()) {
+                *edges_by_kind.entry(e.kind.as_db().to_string()).or_default() += 1;
+            }
+            let (Some(&ca), Some(&cb)) = (ca, cb) else {
                 continue;
             };
             *rel_count.entry(ca).or_default() += 1;
@@ -689,6 +826,12 @@ impl Graph {
         let bounds = self
             .positions
             .values()
+            .filter(|p| {
+                within.map_or(true, |w| {
+                    self.node(p.entity_id)
+                        .is_some_and(|n| is_within_raw(&n.path_raw, &w.path_raw))
+                })
+            })
             .fold(None, |acc: Option<[f64; 4]>, p| {
                 let b = [
                     p.x - p.radius,
@@ -712,8 +855,19 @@ impl Graph {
             flows,
             constellations: self.constellation_views(),
             bounds,
-            total_nodes: self.nodes.len(),
-            total_edges: self.edges.len(),
+            total_nodes: match within {
+                Some(w) => self
+                    .nodes
+                    .iter()
+                    .filter(|n| is_within_raw(&n.path_raw, &w.path_raw))
+                    .count(),
+                None => self.nodes.len(),
+            },
+            total_edges: if within.is_some() {
+                edges_by_kind.values().sum()
+            } else {
+                self.edges.len()
+            },
             edges_by_kind,
         }
     }
@@ -732,10 +886,14 @@ impl Graph {
         let (y0, y1) = (q.y0.min(q.y1), q.y0.max(q.y1));
         let mut visible: Vec<(&GraphNode, &NodePosition)> = Vec::new();
         let mut omitted = 0usize;
+        let within = q.within.and_then(|w| self.node(w));
         for n in &self.nodes {
             let Some(p) = self.positions.get(&n.entity_id) else {
                 continue;
             };
+            if within.is_some_and(|w| !is_within_raw(&n.path_raw, &w.path_raw)) {
+                continue;
+            }
             if p.x + p.radius < x0
                 || p.x - p.radius > x1
                 || p.y + p.radius < y0
@@ -767,7 +925,12 @@ impl Graph {
                     extra.push(f);
                 }
                 for nb in self.neighbors(f, 64) {
-                    if selected.insert(nb.entity_id) {
+                    // In project mode outside entities are shown as satellites, not in place.
+                    let outside = within.is_some_and(|w| {
+                        self.node(nb.entity_id)
+                            .is_some_and(|n| !is_within_raw(&n.path_raw, &w.path_raw))
+                    });
+                    if !outside && selected.insert(nb.entity_id) {
                         extra.push(nb.entity_id);
                     }
                 }
@@ -882,6 +1045,286 @@ impl Graph {
         });
         out.truncate(limit);
         out
+    }
+
+    /// The project of `id`: its ancestor directly under a scan root.
+    pub fn project_of(&self, id: EntityId) -> Option<EntityId> {
+        self.project_of.get(&id).copied()
+    }
+
+    /// Kinship of every pair of projects scoring at least `min_score` (see [`crate::kinship`]).
+    pub fn kinship(&self, min_score: f64) -> Vec<ProjectKin> {
+        let roots: HashSet<EntityId> = self
+            .nodes
+            .iter()
+            .map(|n| n.entity_id)
+            .filter(|&id| self.is_root(id))
+            .collect();
+        project_kinship(&self.nodes, &self.project_of, &roots, min_score)
+    }
+
+    /// Relatives of `project` among `kin`, strongest first.
+    fn relatives_of(&self, project: EntityId, kin: &[ProjectKin]) -> Vec<Relative> {
+        kin.iter()
+            .filter(|k| k.a == project || k.b == project)
+            .filter_map(|k| {
+                let other = if k.a == project { k.b } else { k.a };
+                let n = self.node(other)?;
+                Some(Relative {
+                    id: other,
+                    name: n.name.clone(),
+                    path: n.path_display.clone(),
+                    score: k.score,
+                    vocabulary: k.vocabulary,
+                    shared: k.shared.clone(),
+                    name_root: k.name_root.clone(),
+                    came_first: k.older.map(|o| o == other),
+                })
+            })
+            .collect()
+    }
+
+    fn is_root(&self, id: EntityId) -> bool {
+        self.node(id)
+            .map(|n| {
+                n.parent_entity_id
+                    .map(|p| !self.index.contains_key(&p))
+                    .unwrap_or(true)
+            })
+            .unwrap_or(false)
+    }
+
+    /// Whether a pair of entities in different projects, related by `es`, is shown with threshold
+    /// `min_score`. Manual associations always are. Otherwise the combined score must reach the
+    /// threshold and, unless the threshold is zero, at least one relation must rest on content or
+    /// an explicit link: across projects, name genealogy and temporal proximity are circumstantial
+    /// and mostly pair generic names (`test_x.py` ↔ `x.py`, `CLAUDE.md`, `.gitignore`).
+    fn strong_external(&self, es: &[&Edge], min_score: f64) -> (bool, f64) {
+        let score = combined_score(es.iter().copied(), &self.cfg);
+        if es.iter().any(|e| e.origin == EdgeOrigin::Manual) {
+            return (true, score);
+        }
+        let evidence = min_score <= 0.0
+            || es.iter().any(|e| {
+                !matches!(
+                    e.kind,
+                    RelationKind::NameSimilarity
+                        | RelationKind::TemporalAffinity
+                        | RelationKind::ParentChild
+                )
+            });
+        (evidence && score >= min_score, score)
+    }
+
+    /// Combined score of every (inside, outside) pair of `project` shown with threshold
+    /// `min_score` (see [`Graph::strong_external`]), plus the number of pairs left out.
+    fn external_pairs(&self, project: EntityId, min_score: f64) -> (PairScores, usize) {
+        let Some(root) = self.node(project) else {
+            return (BTreeMap::new(), 0);
+        };
+        let mut pairs: BTreeMap<(EntityId, EntityId), Vec<&Edge>> = BTreeMap::new();
+        for e in &self.edges {
+            let (Some(a), Some(b)) = (self.node(e.src), self.node(e.dst)) else {
+                continue;
+            };
+            let (ia, ib) = (
+                is_within_raw(&a.path_raw, &root.path_raw),
+                is_within_raw(&b.path_raw, &root.path_raw),
+            );
+            if ia == ib {
+                continue;
+            }
+            let key = if ia { (e.src, e.dst) } else { (e.dst, e.src) };
+            pairs.entry(key).or_default().push(e);
+        }
+        let mut weak = 0;
+        let mut out = BTreeMap::new();
+        for (key, es) in pairs {
+            let (strong, score) = self.strong_external(&es, min_score);
+            if !strong {
+                weak += 1;
+                continue;
+            }
+            let mut kinds: Vec<RelationKind> = es.iter().map(|e| e.kind).collect();
+            kinds.sort_unstable();
+            kinds.dedup();
+            out.insert(key, (score, kinds));
+        }
+        (out, weak)
+    }
+
+    /// Projects (directories directly under each scan root), most recently active first, with
+    /// how many outside entities and other projects their relations reach.
+    pub fn projects(&self, min_score: f64) -> Vec<ProjectSummary> {
+        let mut projects: Vec<EntityId> = self
+            .nodes
+            .iter()
+            .filter(|n| n.kind == EntryType::Directory)
+            .filter(|n| {
+                n.parent_entity_id
+                    .is_some_and(|p| self.index.contains_key(&p) && self.is_root(p))
+            })
+            .map(|n| n.entity_id)
+            .collect();
+        projects.sort_unstable();
+        let set: HashSet<EntityId> = projects.iter().copied().collect();
+        let mut outside: HashMap<EntityId, HashSet<EntityId>> = HashMap::new();
+        let mut reached: HashMap<EntityId, HashSet<EntityId>> = HashMap::new();
+        let mut pairs: HashMap<(EntityId, EntityId), Vec<&Edge>> = HashMap::new();
+        for e in &self.edges {
+            let (Some(&pa), Some(&pb)) = (self.project_of.get(&e.src), self.project_of.get(&e.dst))
+            else {
+                continue;
+            };
+            if pa == pb {
+                continue;
+            }
+            let key = if e.src < e.dst {
+                (e.src, e.dst)
+            } else {
+                (e.dst, e.src)
+            };
+            pairs.entry(key).or_default().push(e);
+        }
+        for ((a, b), es) in pairs {
+            if !self.strong_external(&es, min_score).0 {
+                continue;
+            }
+            let (pa, pb) = (self.project_of[&a], self.project_of[&b]);
+            for (p, other, other_p) in [(pa, b, pb), (pb, a, pa)] {
+                if set.contains(&p) {
+                    outside.entry(p).or_default().insert(other);
+                    if set.contains(&other_p) {
+                        reached.entry(p).or_default().insert(other_p);
+                    }
+                }
+            }
+        }
+        let kin = self.kinship(KINSHIP_MIN_SCORE);
+        let mut out: Vec<ProjectSummary> = projects
+            .into_iter()
+            .filter_map(|id| {
+                let n = self.node(id)?;
+                Some(ProjectSummary {
+                    id,
+                    name: n.name.clone(),
+                    path: n.path_display.clone(),
+                    files: n.subtree_files_count,
+                    bytes: n.display_bytes(),
+                    recent_mtime: self.recent.get(&id).copied().filter(|&t| t > 0),
+                    external_links: outside.get(&id).map(HashSet::len).unwrap_or(0),
+                    linked_projects: reached.get(&id).map(HashSet::len).unwrap_or(0),
+                    relatives: self.relatives_of(id, &kin),
+                })
+            })
+            .collect();
+        out.sort_by(|a, b| {
+            b.recent_mtime
+                .cmp(&a.recent_mtime)
+                .then(a.name.cmp(&b.name))
+        });
+        out
+    }
+
+    /// Project mode: outside entities related to `project` (pairs scoring at least `min_score`),
+    /// grouped by the project (or top-level directory) they live in, strongest first, at most
+    /// `limit` entities overall.
+    pub fn project_view(
+        &self,
+        project: EntityId,
+        min_score: f64,
+        limit: usize,
+    ) -> Option<ProjectView> {
+        let root = self.node(project).and_then(|n| self.node_view(n))?;
+        let (pairs, weak_links) = self.external_pairs(project, min_score);
+        // Per outside entity: best score, kinds, and (score, inside entity) pairs.
+        type Acc = (f64, Vec<RelationKind>, Vec<(f64, EntityId)>);
+        let mut by_outer: BTreeMap<EntityId, Acc> = BTreeMap::new();
+        for ((inner, outer), (score, kinds)) in pairs {
+            let entry = by_outer
+                .entry(outer)
+                .or_insert((0.0, Vec::new(), Vec::new()));
+            entry.0 = entry.0.max(score);
+            for k in kinds {
+                if !entry.1.contains(&k) {
+                    entry.1.push(k);
+                }
+            }
+            entry.2.push((score, inner));
+        }
+        let mut links: Vec<ProjectLink> = by_outer
+            .into_iter()
+            .filter_map(|(outer, (score, mut kinds, mut via))| {
+                let n = self.node(outer)?;
+                kinds.sort_unstable();
+                via.sort_by(|a, b| {
+                    b.0.partial_cmp(&a.0)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then(a.1.cmp(&b.1))
+                });
+                via.truncate(32);
+                Some(ProjectLink {
+                    entity_id: outer,
+                    name: n.name.clone(),
+                    path: n.path_display.clone(),
+                    kind: n.kind,
+                    score,
+                    kinds,
+                    via: via.into_iter().map(|(_, id)| id).collect(),
+                })
+            })
+            .collect();
+        let total_links = links.len();
+        links.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.entity_id.cmp(&b.entity_id))
+        });
+        links.truncate(limit);
+        let mut groups: BTreeMap<EntityId, LinkGroup> = BTreeMap::new();
+        for l in links {
+            // Its project directory, or the scan root for entities outside every project.
+            let gid = match self.project_of(l.entity_id) {
+                Some(p) if self.is_root(p) => p,
+                Some(p) if self.node(p).is_some_and(|n| n.kind == EntryType::Directory) => p,
+                Some(p) => self
+                    .node(p)
+                    .and_then(|n| n.parent_entity_id)
+                    .filter(|r| self.index.contains_key(r))
+                    .unwrap_or(p),
+                None => l.entity_id,
+            };
+            let g = groups.entry(gid).or_insert_with(|| {
+                let n = self.node(gid);
+                LinkGroup {
+                    id: gid,
+                    name: n.map(|n| n.name.clone()).unwrap_or_default(),
+                    path: n.map(|n| n.path_display.clone()).unwrap_or_default(),
+                    is_project: !self.is_root(gid),
+                    score: 0.0,
+                    links: Vec::new(),
+                }
+            });
+            g.score = g.score.max(l.score);
+            g.links.push(l);
+        }
+        let mut groups: Vec<LinkGroup> = groups.into_values().collect();
+        groups.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.id.cmp(&b.id))
+        });
+        let relatives = self.relatives_of(project, &self.kinship(KINSHIP_MIN_SCORE));
+        Some(ProjectView {
+            root,
+            breadcrumb: self.breadcrumb(project),
+            groups,
+            total_links,
+            weak_links,
+            relatives,
+        })
     }
 
     fn relation_detail(

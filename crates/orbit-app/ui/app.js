@@ -153,6 +153,10 @@
     linkFrom: null,
     fitScale: 1,
     job: null,
+    // Project mode: only this subtree is drawn, its outside relations orbit around it.
+    project: null,
+    projectView: null,
+    showWeak: false,
   };
   const renderer = new R.Renderer($("canvas"));
   let dirty = true;
@@ -206,6 +210,7 @@
         search: state.search && state.search.positions ? state.search : null,
         dragging: state.dragging,
         hover: state.hover,
+        project: state.project != null && state.projectView ? Object.assign({ highlight: projectHighlight() }, state.projectView) : null,
       });
     }
     requestAnimationFrame(frame);
@@ -214,14 +219,18 @@
   // -------------------------------------------------------------------------------------------
   // Data loading
   // -------------------------------------------------------------------------------------------
+  // Leaves room around a project's disc for the orbit of its outside relations.
+  const fitPadding = () => (state.project != null ? 0.62 : 0.9);
+
   async function loadOverview(fit) {
-    state.overview = await GET("/api/graph/overview?max_clusters=300&max_flows=250");
+    const within = state.project != null ? `&within=${state.project}` : "";
+    state.overview = await GET("/api/graph/overview?max_clusters=300&max_flows=250" + within);
     const b = state.overview.bounds;
     $("empty").classList.toggle("hidden", state.overview.total_nodes > 0);
     if (b) {
       const cam = renderer.cam;
       const saved = { cx: cam.cx, cy: cam.cy, scale: cam.scale };
-      state.fitScale = R.fitBounds(cam, b, 0.9);
+      state.fitScale = R.fitBounds(cam, b, fitPadding());
       if (!fit) Object.assign(cam, saved);
     }
     renderLegend();
@@ -248,6 +257,7 @@
       min_px: zoomRatio() < 3 ? 2.5 : 0.7, max_nodes: 2500, max_edges: 1500, kinds,
     });
     if (state.focus != null) q.set("focus", state.focus);
+    if (state.project != null) q.set("within", state.project);
     try {
       const r = await GET("/api/graph/region?" + q.toString(), regionAbort.signal);
       state.nodes = new Map(r.nodes.map((n) => [n.id, n]));
@@ -275,10 +285,12 @@
       if (state.focus !== id) return;
       state.detail = d;
       state.neighbors = new Set(d.neighbors.map((n) => n.entity_id));
-      state.satellites = d.satellites;
-      renderPanel(d);
+      state.satellites = state.project != null ? [] : d.satellites;
+      // In project mode an outside entity is shown in the panel only (it is not drawn).
+      const outside = state.project != null && !d.breadcrumb.some((b) => b.id === state.project);
+      renderPanel(d, outside ? d.breadcrumb[1] : null);
       renderBreadcrumb(d.breadcrumb);
-      if (o.fly && d.position) flyTo(d.position.x, d.position.y, o.zoomTo ? d.position.radius : null);
+      if (o.fly && d.position && !outside) flyTo(d.position.x, d.position.y, o.zoomTo ? d.position.radius : null);
       scheduleRegion();
     } catch (e) {
       fail(e);
@@ -294,7 +306,8 @@
     state.satellites = [];
     $("panel").classList.add("hidden");
     document.body.classList.remove("panel-open");
-    setKids($("breadcrumb"));
+    if (state.projectView) renderBreadcrumb(state.projectView.breadcrumb);
+    else setKids($("breadcrumb"));
     updateSelectionBar();
     invalidate();
   }
@@ -326,7 +339,7 @@
     return el("span", { class: "rel-kind", style: { background: R.KIND_COLORS[kind] || "#aaa" } }, label);
   }
 
-  function renderPanel(d) {
+  function renderPanel(d, otherProject) {
     const n = d.node;
     const body = $("panel-body");
     const kindLabel = { directory: "directory", file: "file", symlink: "link simbolico", other: "altro" }[n.kind] || n.kind;
@@ -421,6 +434,12 @@
     setKids(body, 
       el("h2", {}, n.name || "/", stateBadge),
       el("div", { class: "path" }, n.path_display),
+      otherProject
+        ? el("div", { class: "note" }, "Fuori dal progetto corrente. ",
+            otherProject.id !== d.node.entity_id
+              ? el("button", { onclick: () => enterProject(otherProject.id) }, `Apri il progetto «${otherProject.name}»`)
+              : null)
+        : null,
       actions,
       el("h3", {}, "Metadati"),
       kv,
@@ -492,6 +511,18 @@
   function renderFilters() {
     const box = $("filters");
     setKids(box, 
+      state.project != null
+        ? el("button", {
+            class: state.showWeak ? "on" : "",
+            title: "Collegamenti con altri progetti basati solo su nomi simili o modifiche ravvicinate",
+            onclick: () => {
+              state.showWeak = !state.showWeak;
+              renderFilters();
+              loadProjectView().catch(fail);
+            },
+          }, el("span", { class: "swatch", style: { background: "#888", opacity: state.showWeak ? 1 : 0.25 } }),
+            state.projectView && !state.showWeak ? `deboli (${state.projectView.weak_links})` : "deboli")
+        : null,
       ...ALL_KINDS.map((k) =>
         el("button", {
           class: state.kindsOn.has(k) ? "on" : "",
@@ -822,13 +853,19 @@
       select(h.id, { fly: true, zoomTo: true });
       return;
     }
+    if (h.group) {
+      renderGroupPanel(h.group);
+      return;
+    }
     select(h.id, { additive: e.shiftKey, fly: !!h.satellite });
   });
 
   canvas.addEventListener("dblclick", (e) => {
     const rect = canvas.getBoundingClientRect();
     const h = renderer.hit(e.clientX - rect.left, e.clientY - rect.top);
-    if (h) select(h.id, { fly: true, zoomTo: true });
+    if (h && h.group) {
+      if (h.group.is_project) enterProject(h.group.id);
+    } else if (h) select(h.id, { fly: true, zoomTo: true });
   });
 
   window.addEventListener("keydown", (e) => {
@@ -844,7 +881,7 @@
       $("search").focus();
     } else if (e.key === "f" || e.key === "F") {
       if (state.overview && state.overview.bounds) {
-        state.fitScale = R.fitBounds(renderer.cam, state.overview.bounds, 0.9);
+        state.fitScale = R.fitBounds(renderer.cam, state.overview.bounds, fitPadding());
         invalidate();
         scheduleRegion();
       }
@@ -871,6 +908,7 @@
       b.setAttribute("aria-selected", String(b.dataset.mode === mode));
     });
     $("sheet").classList.toggle("hidden", mode === "explore");
+    if (mode === "projects") renderProjects();
     if (mode === "history") renderHistory();
     if (mode === "recover") renderRecover();
   }
@@ -878,6 +916,173 @@
   function goToEntity(id) {
     setMode("explore");
     select(id, { fly: true, zoomTo: true });
+  }
+
+  // -------------------------------------------------------------------------------------------
+  // Projects: pick a project, see only its tree and what elsewhere relates to it
+  // -------------------------------------------------------------------------------------------
+  function savedProject() {
+    try {
+      const v = localStorage.getItem("orbit-project");
+      return v ? Number(v) : null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function saveProject(id) {
+    try {
+      if (id == null) localStorage.removeItem("orbit-project");
+      else localStorage.setItem("orbit-project", String(id));
+    } catch (_) {
+      /* per-viewer convenience only */
+    }
+  }
+
+  /** Inside entities whose outside relations stand out: the focus and, for a directory, the
+   * loaded nodes under it. `null` when nothing inside the project is focused. */
+  function projectHighlight() {
+    const f = state.focus;
+    if (f == null || f === state.project || !state.nodes.has(f)) return null;
+    const ids = new Set([f]);
+    for (const n of state.nodes.values()) {
+      let p = n.parent;
+      let guard = 0;
+      while (p != null && guard++ < 512) {
+        if (p === f) {
+          ids.add(n.id);
+          break;
+        }
+        const pn = state.nodes.get(p);
+        p = pn ? pn.parent : null;
+      }
+    }
+    return ids;
+  }
+
+  async function loadProjectView() {
+    if (state.project == null) return;
+    const id = state.project;
+    const v = await GET(`/api/graph/project?id=${id}&limit=120${state.showWeak ? "&min_score=0" : ""}`);
+    if (state.project !== id) return;
+    // Related projects join the planets: on the group of the same project, or as their own.
+    for (const r of v.relatives) {
+      const g = v.groups.find((x) => x.id === r.id);
+      if (g) g.relative = r;
+      else v.groups.push({ id: r.id, name: r.name, path: r.path, is_project: true, score: r.score, links: [], relative: r });
+    }
+    v.groups.sort((a, b) => Number(!!b.relative) - Number(!!a.relative) || b.score - a.score);
+    state.projectView = v;
+    renderFilters();
+    if (state.focus == null) renderBreadcrumb(v.breadcrumb);
+    invalidate();
+  }
+
+  async function enterProject(id) {
+    state.project = id;
+    state.projectView = null;
+    saveProject(id);
+    clearSelection();
+    endSearch();
+    setMode("explore");
+    try {
+      await loadProjectView();
+      await loadOverview(true);
+    } catch (e) {
+      // The saved project may no longer exist (other database, rescan): back to the list.
+      state.project = null;
+      saveProject(null);
+      fail(e);
+      setMode("projects");
+    }
+    renderFilters();
+  }
+
+  async function leaveProject() {
+    state.project = null;
+    state.projectView = null;
+    saveProject(null);
+    clearSelection();
+    setMode("explore");
+    renderFilters();
+    await loadOverview(true);
+  }
+
+  async function renderProjects() {
+    const body = $("sheet-body");
+    setKids(body, el("h2", {}, "Progetti"), el("p", { class: "note" }, "Caricamento…"));
+    let ps;
+    try {
+      ps = await GET("/api/projects");
+    } catch (e) {
+      fail(e);
+      return;
+    }
+    const linked = ps.filter((p) => p.external_links > 0).length;
+    setKids(body,
+      el("h2", {}, "Progetti"),
+      el("p", { class: "note" }, ps.length
+        ? `Scegli un progetto: vedrai solo il suo albero e, attorno, i progetti da cui deriva o che ne derivano e ciò che altrove è collegato ad esso (riferimenti, duplicati, file identici). ${ps.filter((p) => p.relatives.length).length} progetti hanno una famiglia, ${linked} su ${ps.length} hanno file collegati con il resto.`
+        : "Nessun progetto: scansiona la cartella che contiene i tuoi progetti (es. ~/projects). Ogni sua sottocartella diventa un progetto."),
+      el("div", { class: "controls" },
+        state.project != null ? el("button", { onclick: () => setMode("explore") }, "Torna al progetto") : null,
+        el("button", { onclick: leaveProject }, "Mappa completa")),
+      el("table", { class: "projects" },
+        el("tr", {}, ["progetto", "file", "dimensione", "ultima attività", "famiglia", "collegamenti esterni"].map((h) => el("th", {}, h))),
+        ps.map((p) => el("tr", { class: "row-click" + (p.id === state.project ? " current" : ""), onclick: () => enterProject(p.id) },
+          el("td", {}, el("b", {}, p.name)),
+          el("td", { class: "num" }, String(p.files)),
+          el("td", { class: "num" }, bytes(p.bytes)),
+          el("td", {}, p.recent_mtime ? new Date(p.recent_mtime * 1000).toLocaleDateString("it-IT") : "—"),
+          el("td", {}, p.relatives.length ? p.relatives.map((r, i) => [i ? el("br") : null, kinLabel(r)]) : el("span", { class: "muted" }, "—")),
+          el("td", {}, p.external_links ? `${p.external_links} con ${p.linked_projects} progett${p.linked_projects === 1 ? "o" : "i"}` : el("span", { class: "muted" }, "—"))))));
+  }
+
+  /** "deriva da X" / "origine di X" / "imparentato con X", from the current project's side. */
+  function kinLabel(r) {
+    if (r.came_first === true) return `deriva da ${r.name}`;
+    if (r.came_first === false) return `origine di ${r.name}`;
+    return `imparentato con ${r.name}`;
+  }
+
+  function kinExplanation(r) {
+    const current = state.projectView ? state.projectView.root.name : "questo progetto";
+    return el("div", { class: "rel" },
+      el("div", { class: "rel-head" }, kindChip("project_membership", "parentela"), el("span", { class: "badge" }, r.score.toFixed(2))),
+      el("ul", {},
+        el("li", {}, `Struttura e nomi in comune (somiglianza ${r.vocabulary.toFixed(2)}): `, el("span", { class: "mono" }, r.shared.join(", "))),
+        r.name_root ? el("li", {}, `Stessa radice nel nome: «${r.name_root}»`) : null,
+        el("li", {}, r.came_first === true ? `${r.name} è nato prima di ${current}`
+          : r.came_first === false ? `${r.name} è nato dopo ${current}`
+          : "Iniziati nello stesso periodo: non si sa chi venga prima")),
+      el("div", { class: "note" }, "La parentela non richiede file identici: rileva progetti riscritti a partire da un altro o costruiti con la stessa architettura."));
+  }
+
+  /** Panel for a planet: a related project and/or the outside entities of one group. */
+  function renderGroupPanel(g) {
+    const name = (id) => {
+      const n = state.nodes.get(id);
+      return n ? n.name : "#" + id;
+    };
+    setKids($("panel-body"),
+      el("h2", {}, g.name),
+      el("div", { class: "path" }, g.path),
+      el("div", { class: "actions" },
+        g.is_project ? el("button", { class: "primary", onclick: () => enterProject(g.id) }, "Apri questo progetto") : null,
+        el("button", { onclick: () => openEntity(g.id, "reveal") }, "Apri nel file manager")),
+      g.relative ? [el("h3", {}, kinLabel(g.relative)), kinExplanation(g.relative)] : null,
+      g.links.length ? el("h3", {}, `${g.links.length} file collegat${g.links.length === 1 ? "o" : "i"} al progetto corrente`) : null,
+      g.links.map((l) => el("div", { class: "rel" },
+        el("div", { class: "rel-head" },
+          l.kinds.map((k) => kindChip(k, R.KIND_LABELS[k] || k)),
+          el("span", { class: "badge" }, l.score.toFixed(2))),
+        el("div", {}, el("span", { class: "rel-other", title: l.path, onclick: () => select(l.entity_id) }, l.name)),
+        el("div", { class: "path" }, l.path),
+        el("div", { class: "note" }, "↔ ", l.via.slice(0, 6).map((v, i) => [i ? ", " : "",
+          el("span", { class: "rel-other", onclick: () => select(v, { fly: true }) }, name(v))]),
+          l.via.length > 6 ? ` e altri ${l.via.length - 6}` : ""))));
+    $("panel").classList.remove("hidden");
+    document.body.classList.add("panel-open");
   }
 
   async function renderHistory() {
@@ -1018,9 +1223,16 @@
     if (s.graph_version !== state.graphVersion) {
       const first = state.graphVersion === 0;
       state.graphVersion = s.graph_version;
+      if (first) {
+        const saved = savedProject();
+        if (saved != null) await enterProject(saved);
+        else if (s.store && s.store.entities_present) setMode("projects");
+      }
+      if (state.project != null && !first) await loadProjectView().catch(fail);
+      if (!first && state.mode === "projects") renderProjects();
       await loadOverview(first || (lastJob && !job));
     }
-    if (!$("scan-path").value && s.home) $("scan-path").value = s.home;
+    if (!$("scan-path").value && s.home) $("scan-path").value = s.home + "/projects";
     lastJob = job;
     setTimeout(pollStatus, job ? 600 : 4000);
   }

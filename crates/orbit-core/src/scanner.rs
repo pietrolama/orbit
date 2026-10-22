@@ -1274,6 +1274,26 @@ fn is_configured_exclusion(config: &ScanConfig, abs_path: &Path) -> bool {
         .any(|p| p.as_path() == abs_path)
 }
 
+/// `true` if the directory's name is in `excluded_names` (`target` only next to a `Cargo.toml`,
+/// so that an unrelated folder called "target" is still walked). With name exclusions enabled, a
+/// Python virtualenv is recognised by its `pyvenv.cfg` whatever its name (`.venv-gpu`, `env`).
+fn is_excluded_name(config: &ScanConfig, abs_path: &Path) -> bool {
+    if config.excluded_names.is_empty() {
+        return false;
+    }
+    let Some(name) = abs_path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    if !config.excluded_names.iter().any(|n| n == name) {
+        return abs_path.join("pyvenv.cfg").is_file();
+    }
+    name != "target"
+        || abs_path
+            .parent()
+            .map(|p| p.join("Cargo.toml").is_file())
+            .unwrap_or(false)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn process_directory_child(
     result: &mut ScanResult,
@@ -1298,7 +1318,8 @@ fn process_directory_child(
     // `/sys`, `/dev`, `/run`), and respect `cross_mounts == false` for other filesystem devices
     // (`st_dev != root_dev`).
     let is_pseudo = is_configured_exclusion(config, &child_abs_path);
-    if is_pseudo || (!config.cross_mounts && dev != result.root_dev) {
+    let is_name = !is_pseudo && is_excluded_name(config, &child_abs_path);
+    if is_pseudo || is_name || (!config.cross_mounts && dev != result.root_dev) {
         result.total_dirs_count += 1;
         result.excluded_mounts_count += 1;
         result.entries.push(EntryNode {
@@ -1331,7 +1352,12 @@ fn process_directory_child(
             mtime_sec: Some(meta.mtime()),
             mtime_nsec: u32::try_from(meta.mtime_nsec()).ok(),
             access_status: AccessStatus::ExcludedMount,
-            error_message: Some(if is_pseudo {
+            error_message: Some(if is_name {
+                format!(
+                    "Directory esclusa per nome: dipendenze, cache o build ({})",
+                    child_abs_path.display()
+                )
+            } else if is_pseudo {
                 format!(
                     "Percorso escluso dalla configurazione di scansione ({})",
                     child_abs_path.display()

@@ -64,7 +64,7 @@ Tre livelli distinti (vedi `docs/SCHEMA_V1.sql`):
 
 ## Layout
 
-Circle packing gerarchico: ogni directory è un disco i cui figli sono piazzati su una spirale ad angolo aureo attorno a un nucleo riservato, saltando le posizioni che sovrappongono un fratello (griglia spaziale). Il packing è calcolato dal basso per i sottoalberi senza posizione, poi il sottoalbero viene piazzato vicino al genitore già posizionato. La fase angolare deriva da `hash(seed, id)`, mai dall'ordine di iterazione.
+Circle packing gerarchico: ogni directory è il disco minimo che racchiude i suoi figli, piazzati dal più grande al più piccolo su una spirale ad angolo aureo attorno al baricentro di quelli già piazzati, saltando le posizioni che sovrappongono un fratello (griglia spaziale). Non c'è un nucleo riservato al centro: una directory con un solo figlio dominante è appena più grande di lui, così la profondità aggiunge al raggio invece di moltiplicarlo (la UI disegna il glifo della directory sul bordo superiore del disco). Il packing è calcolato dal basso per i sottoalberi senza posizione, poi il sottoalbero viene piazzato vicino al genitore già posizionato. La fase angolare deriva da `hash(seed, id)`, mai dall'ordine di iterazione.
 
 Regole: le posizioni esistenti non vengono ricalcolate; pin e posizioni manuali non vengono mai mossi (garantito anche in SQL: l'upsert automatico ha `WHERE pinned = 0 AND source = 'auto'`); un nodo automatico il cui genitore fisico è cambiato viene ripiazzato vicino al nuovo genitore e i suoi discendenti automatici traslati con lui. `orbit layout reset` ricalcola tutto tranne i nodi bloccati.
 
@@ -77,6 +77,16 @@ Regole: le posizioni esistenti non vengono ricalcolate; pin e posizioni manuali 
 | File | `GET /api/graph/entity` | metadati, fingerprint, relazioni spiegate (anche nascoste/eliminate, ripristinabili), satelliti, cronologia, identità incerte, anteprima | — |
 
 I *satelliti* sono entità correlate fuori dal sottoalbero del nodo a fuoco: la UI li disegna su un'orbita tratteggiata con un filo verso la posizione reale, così non sembrano figli fisici.
+
+## Modalità Progetto
+
+Un *progetto* è una directory direttamente sotto una radice di scansione (es. `~/projects/<nome>`). È la vista di partenza della UI: si sceglie un progetto da `GET /api/projects` e si vede solo il suo albero (`within=<id>` su overview e region); ciò che altrove è collegato ad esso (`GET /api/graph/project`) orbita attorno al suo disco, raggruppato per progetto di destinazione, con una linea da ciascun file interno coinvolto.
+
+Tra progetti diversi, genealogia del nome e prossimità temporale sono indizi circostanziali (accoppiano soprattutto nomi generici: `test_x.py` ↔ `x.py`, `CLAUDE.md`, `.gitignore`). Con la soglia predefinita (punteggio combinato ≥ 0.4) una coppia esterna è mostrata solo se almeno una relazione poggia sul contenuto o su un legame esplicito (riferimento, duplicato, fingerprint, costellazione) o se è manuale; con `min_score=0` («deboli» nella UI) compaiono tutte.
+
+**Parentela tra progetti** (`kinship.rs`): un progetto riscritto a partire da un altro non lascia file identici né riferimenti, ma ne conserva il vocabolario. Ogni progetto è l'insieme dei nomi di file e cartelle (senza estensione) più le coppie `cartella/nome`, esclusi gli alberi generati (`build`, `CMakeFiles`, `.godot`, `.chroma`, `*.egg-info`, `vendor`, …); due progetti si confrontano con il coseno pesato `idf²` (nomi usati da più di metà dei progetti ignorati). Una parola di almeno 4 lettere condivisa dai nomi dei progetti e rara (≤ 3 progetti) amplifica il segnale (`+min(0.5, 2·v)`) ma non lo crea da sola. Chi è nato prima si deduce dal 10° percentile delle mtime, dichiarato solo con almeno 3 giorni di distanza. Soglia predefinita 0.5; i parenti compaiono in `ProjectSummary.relatives` e `ProjectView.relatives` con nomi condivisi, radice del nome e ordine.
+
+La scansione salta per nome le directory di dipendenze, VCS, cache di strumenti e build (`.git`, `node_modules`, `.venv`/`venv` e ogni directory con `pyvenv.cfg`, `__pycache__`, `target` accanto a un `Cargo.toml`, …): restano visibili come nodi non attraversati (`--no-default-excludes` le include).
 
 ## Ricerca
 
@@ -93,8 +103,10 @@ Versione del contratto: `X-Orbit-Api: 1` su ogni risposta, `api_version` in `/ap
 | `POST /api/scan/start` | `{root_path, follow_symlinks?, cross_mounts?, verify_duplicates?}` | `{started, job_id}` |
 | `POST /api/scan/cancel` | `{}` | `{cancelled}` |
 | `POST /api/relations/refresh` | `{verify_duplicates?}` | report di indicizzazione |
-| `GET /api/graph/overview` | `max_clusters, max_flows` | `OverviewView` |
-| `GET /api/graph/region` | `x0,y0,x1,y1,scale,min_px?,max_nodes?,max_edges?,min_strength?,kinds?,focus?` | `RegionView` |
+| `GET /api/graph/overview` | `max_clusters, max_flows, within?` | `OverviewView` |
+| `GET /api/graph/region` | `x0,y0,x1,y1,scale,min_px?,max_nodes?,max_edges?,min_strength?,kinds?,focus?,within?` | `RegionView` |
+| `GET /api/projects` | `min_score?` (default 0.4) | `[ProjectSummary]`, più recenti prima |
+| `GET /api/graph/project` | `id, min_score?, limit?` (default 0.4, 80) | `ProjectView`: radice, gruppi di collegamenti esterni, totali e deboli esclusi |
 | `GET /api/graph/entity` | `id` | `EntityDetail` |
 | `POST /api/search` | `{query, limit?}` | `{search: SearchResponse, nodes: [NodeView]}` |
 | `GET /api/history/snapshots` | — | `[SnapshotHeader]` |

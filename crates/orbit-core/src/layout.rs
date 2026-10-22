@@ -1,8 +1,10 @@
 //! Deterministic, persistent, incremental spatial layout.
 //!
-//! The layout is a hierarchical circle packing: every directory is a disc whose children are
-//! placed around a reserved core on a golden-angle spiral, skipping positions that would overlap
-//! an already placed sibling. Packing is computed bottom-up for subtrees that have no position yet,
+//! The layout is a hierarchical circle packing: every directory is the disc enclosing its
+//! children, which are placed largest first on a golden-angle spiral from the centre, skipping
+//! positions that would overlap an already placed sibling. There is no reserved core: a directory
+//! with one dominant child is only slightly larger than that child, so nesting depth adds to the
+//! radius instead of multiplying it (the UI draws the directory's own glyph on its rim). Packing is computed bottom-up for subtrees that have no position yet,
 //! then the subtree is placed next to its positioned parent.
 //!
 //! Stability rules (see `docs/PRODUCT_DECISIONS.md`):
@@ -76,7 +78,7 @@ pub struct LayoutConfig {
     pub layout_version: u32,
     /// Gap between sibling discs, in world units.
     pub padding: f64,
-    /// Radius of the reserved core at the centre of a directory disc.
+    /// Radius of an empty directory disc, and the minimum radius of any directory.
     pub dir_core_radius: f64,
 }
 
@@ -162,7 +164,8 @@ impl Grid {
         self.circles.push((x, y, r));
         let (x0, x1, y0, y1) = self.cell_range(x, y, r);
         // Very large circles (rare: huge subdirectories) are bounded to a reasonable cell count.
-        if (x1 - x0 + 1) * (y1 - y0 + 1) > 4096 {
+        // Saturating: far-away or huge circles must not wrap around into a giant cell loop.
+        if span(x0, x1).saturating_mul(span(y0, y1)) > 4096 {
             self.cells
                 .entry((i64::MIN, i64::MIN))
                 .or_default()
@@ -190,6 +193,12 @@ impl Grid {
             }
         }
         let (x0, x1, y0, y1) = self.cell_range(x, y, r + pad);
+        // A disc much larger than the cells would visit (r/cell)^2 cells: when that exceeds the
+        // number of placed discs, comparing against every disc directly is cheaper.
+        let cells = span(x0, x1).saturating_mul(span(y0, y1));
+        if cells > self.circles.len() as i64 {
+            return (0..self.circles.len()).any(|i| check(&i));
+        }
         for cx in x0..=x1 {
             for cy in y0..=y1 {
                 if let Some(list) = self.cells.get(&(cx, cy)) {
@@ -203,30 +212,95 @@ impl Grid {
     }
 }
 
+/// Number of grid cells in `lo..=hi`, saturating instead of overflowing.
+fn span(lo: i64, hi: i64) -> i64 {
+    hi.saturating_sub(lo).saturating_add(1)
+}
+
 /// Finds a free spot for a circle of radius `r` around `(cx, cy)` on a golden-angle spiral that
-/// starts at distance `start`, avoiding circles already in `grid`.
+/// starts at the centre, avoiding circles already in `grid`.
+///
+/// The spiral step is the circle's own size (`step`), and the search begins at distance
+/// `d_from` (minus a few spiral indices) rather than at the centre; the distance of the chosen spot is returned. Callers keep a
+/// distance cursor between siblings, so placing n children costs O(n) attempts overall instead of
+/// rescanning the filled centre for each one (quadratic for a directory with 40 000 files), and a
+/// very large child does not crawl outwards with the tiny step of its small siblings.
 #[allow(clippy::too_many_arguments)]
 fn spiral_place(
     grid: &Grid,
     cx: f64,
     cy: f64,
     r: f64,
-    start: f64,
     step: f64,
     phase: f64,
     pad: f64,
-) -> (f64, f64) {
-    let mut k: u64 = 0;
+    d_from: f64,
+) -> (f64, f64, f64) {
+    // Resume at the cursor, a few spiral turns back so small gaps near the frontier still fill.
+    let first = ((d_from.max(0.0) / step).powi(2).floor() as u64).saturating_sub(48);
+    let mut k: u64 = first;
     loop {
-        let d = start + r + step * (k as f64).sqrt();
+        let d = step * (k as f64).sqrt();
         let theta = phase + k as f64 * GOLDEN_ANGLE;
         let x = cx + d * theta.cos();
         let y = cy + d * theta.sin();
-        if !grid.overlaps(x, y, r, pad) || k > 2_000_000 {
-            return (x, y);
+        if !grid.overlaps(x, y, r, pad) || k > first + 2_000_000 {
+            return (x, y, d);
         }
         k += 1;
     }
+}
+
+/// Approximately smallest disc enclosing `discs` (`(_, x, y, r)`): Bădoiu–Clarkson iterations
+/// pull a centre towards the farthest rim, then the radius is measured exactly from that centre,
+/// so the result always encloses every disc. Falls back to the origin if that is tighter.
+fn enclosing_disc<T>(discs: &[(T, f64, f64, f64)]) -> (f64, f64, f64) {
+    let reach = |cx: f64, cy: f64| -> (usize, f64) {
+        let mut best = (0, f64::NEG_INFINITY);
+        for (i, &(_, x, y, r)) in discs.iter().enumerate() {
+            let d = (x - cx).hypot(y - cy) + r;
+            if d > best.1 {
+                best = (i, d);
+            }
+        }
+        best
+    };
+    let (_, at_origin) = reach(0.0, 0.0);
+    if discs.len() < 2 {
+        return (0.0, 0.0, at_origin.max(0.0));
+    }
+    let (mut x0, mut x1, mut y0, mut y1) = (f64::MAX, f64::MIN, f64::MAX, f64::MIN);
+    for &(_, x, y, r) in discs {
+        x0 = x0.min(x - r);
+        x1 = x1.max(x + r);
+        y0 = y0.min(y - r);
+        y1 = y1.max(y + r);
+    }
+    let (mut cx, mut cy) = ((x0 + x1) / 2.0, (y0 + y1) / 2.0);
+    for i in 1..=128 {
+        let (j, _) = reach(cx, cy);
+        let (_, x, y, r) = discs[j];
+        let len = (x - cx).hypot(y - cy);
+        let (fx, fy) = if len > 1e-12 {
+            (x + r * (x - cx) / len, y + r * (y - cy) / len)
+        } else {
+            (x + r, y)
+        };
+        let t = 1.0 / (i as f64 + 1.0);
+        cx += (fx - cx) * t;
+        cy += (fy - cy) * t;
+    }
+    let (_, rad) = reach(cx, cy);
+    if rad < at_origin {
+        (cx, cy, rad)
+    } else {
+        (0.0, 0.0, at_origin)
+    }
+}
+
+/// Spiral step for a disc of radius `r` among siblings of typical step `base`.
+fn step_for(r: f64, base: f64, pad: f64) -> f64 {
+    base.max(r * 1.05 + pad)
 }
 
 /// Bottom-up packing of a subtree whose nodes have no positions. Returns per-node offsets
@@ -274,27 +348,47 @@ fn pack_subtree(
         rs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let median = rs[rs.len() / 2];
         let mut grid = Grid::new(median * 2.0 + cfg.padding);
-        grid.insert(0.0, 0.0, cfg.dir_core_radius);
         let phase = phase_for(cfg.seed, v);
         let step = median * 1.05 + cfg.padding;
-        let mut enclosing = cfg.dir_core_radius;
+        let mut cursor = 0.0f64;
+        let mut class_step = f64::INFINITY;
+        // Area-weighted centroid of the children placed so far: the spiral turns around it, so
+        // small children fill the nooks next to the large ones instead of a ring on the far side.
+        let (mut sx, mut sy, mut sa) = (0.0f64, 0.0f64, 0.0f64);
+        let mut placed: Vec<(EntityId, f64, f64, f64)> = Vec::with_capacity(sorted.len());
         for c in sorted {
             let r = radius[&c];
-            let (x, y) = spiral_place(
-                &grid,
-                0.0,
-                0.0,
-                r,
-                cfg.dir_core_radius,
-                step,
-                phase,
-                cfg.padding,
-            );
+            let st = step_for(r, step, cfg.padding);
+            // Children come largest first: once they get much smaller, restart the search from
+            // the centre so they can use the gaps left between the larger ones. Within a size
+            // class the cursor keeps placement linear.
+            if st < class_step * 0.5 {
+                class_step = st;
+                cursor = 0.0;
+            }
+            let (cx, cy) = if sa > 0.0 {
+                (sx / sa, sy / sa)
+            } else {
+                (0.0, 0.0)
+            };
+            let (x, y, d) = spiral_place(&grid, cx, cy, r, st, phase, cfg.padding, cursor);
+            // The largest child takes the centre; the others can only fit outside its rim.
+            cursor = cursor.max(d.max(r));
             grid.insert(x, y, r);
-            enclosing = enclosing.max((x * x + y * y).sqrt() + r);
-            local.insert(c, (x, y));
+            let a = r * r;
+            sx += x * a;
+            sy += y * a;
+            sa += a;
+            placed.push((c, x, y, r));
         }
-        radius.insert(v, enclosing + cfg.padding);
+        // The directory sits at the centre of the smallest disc enclosing its children, not at
+        // the spiral origin: with two or three large children that saves up to a third of the
+        // radius at every level of nesting.
+        let (mx, my, enclosing) = enclosing_disc(&placed);
+        for &(c, x, y, _) in &placed {
+            local.insert(c, (x - mx, y - my));
+        }
+        radius.insert(v, (enclosing + cfg.padding).max(cfg.dir_core_radius));
     }
 
     // Accumulate offsets from the subtree root, top-down.
@@ -348,6 +442,9 @@ pub fn update_layout(
     let mut result = LayoutResult::default();
 
     let mut changed: BTreeMap<EntityId, NodePosition> = BTreeMap::new();
+    // One placer per parent (and one for the top level), reused across all nodes placed in this
+    // pass, so that many new files in one directory cost linear time.
+    let mut placers: HashMap<Option<EntityId>, Placer> = HashMap::new();
 
     // 1) New subtree roots: nodes without position whose parent is positioned or absent.
     let mut new_roots: Vec<EntityId> = nodes
@@ -364,10 +461,11 @@ pub fn update_layout(
     for root in new_roots {
         let (offsets, radii) = pack_subtree(root, &children, &by_id, cfg);
         let r = radii[&root];
-        let (cx, cy) = match parent_of(root) {
-            Some(parent) => place_near_parent(parent, r, &children, &current, cfg, root),
-            None => place_top_level(r, &current, nodes, &by_id, cfg, root),
-        };
+        let parent = parent_of(root);
+        let (cx, cy) = placers
+            .entry(parent)
+            .or_insert_with(|| Placer::new(parent, &children, &current, nodes, &by_id, cfg))
+            .place(r, cfg);
         let mut ids: Vec<&EntityId> = offsets.keys().collect();
         ids.sort_unstable();
         for id in ids {
@@ -434,7 +532,10 @@ pub fn update_layout(
             continue;
         };
         let old = current[&id].clone();
-        let (nx, ny) = place_near_parent(parent, old.radius, &children, &current, cfg, id);
+        let (nx, ny) = placers
+            .entry(Some(parent))
+            .or_insert_with(|| Placer::new(Some(parent), &children, &current, nodes, &by_id, cfg))
+            .place(old.radius, cfg);
         let (dx, dy) = (nx - old.x, ny - old.y);
         let mut np = old.clone();
         np.x = nx;
@@ -468,81 +569,91 @@ pub fn update_layout(
     result
 }
 
-fn place_near_parent(
-    parent: EntityId,
-    r: f64,
-    children: &BTreeMap<EntityId, Vec<EntityId>>,
-    current: &HashMap<EntityId, NodePosition>,
-    cfg: &LayoutConfig,
-    exclude: EntityId,
-) -> (f64, f64) {
-    let p = &current[&parent];
-    let siblings: Vec<&NodePosition> = children
-        .get(&parent)
-        .map(|v| {
-            v.iter()
-                .filter(|&&c| c != exclude)
-                .filter_map(|c| current.get(c))
-                .collect()
-        })
-        .unwrap_or_default();
-    let typical = siblings
-        .iter()
-        .map(|s| s.radius)
-        .fold(r, f64::max)
-        .min(r * 4.0 + 2.0);
-    let mut grid = Grid::new(typical * 2.0 + cfg.padding);
-    grid.insert(p.x, p.y, cfg.dir_core_radius);
-    for s in &siblings {
-        grid.insert(s.x, s.y, s.radius);
-    }
-    let phase = phase_for(cfg.seed, parent);
-    spiral_place(
-        &grid,
-        p.x,
-        p.y,
-        r,
-        cfg.dir_core_radius,
-        r * 1.05 + cfg.padding,
-        phase,
-        cfg.padding,
-    )
+/// Places successive discs around a parent (or around the origin for top-level trees), keeping
+/// the obstacle grid and the spiral cursor between calls.
+struct Placer {
+    grid: Grid,
+    cx: f64,
+    cy: f64,
+    pad: f64,
+    phase: f64,
+    cursor: f64,
 }
 
-fn place_top_level(
-    r: f64,
-    current: &HashMap<EntityId, NodePosition>,
-    nodes: &[GraphNode],
-    by_id: &HashMap<EntityId, &GraphNode>,
-    cfg: &LayoutConfig,
-    _id: EntityId,
-) -> (f64, f64) {
-    // Top-level discs (scan roots, unrelated trees) avoid every other top-level disc.
-    let mut grid = Grid::new(r.max(8.0));
-    for n in nodes {
-        let is_top = n
-            .parent_entity_id
-            .map(|p| !by_id.contains_key(&p))
-            .unwrap_or(true);
-        if is_top {
-            if let Some(pos) = current.get(&n.entity_id) {
-                grid.insert(pos.x, pos.y, pos.radius);
+impl Placer {
+    fn new(
+        parent: Option<EntityId>,
+        children: &BTreeMap<EntityId, Vec<EntityId>>,
+        current: &HashMap<EntityId, NodePosition>,
+        nodes: &[GraphNode],
+        by_id: &HashMap<EntityId, &GraphNode>,
+        cfg: &LayoutConfig,
+    ) -> Self {
+        match parent {
+            Some(parent) => {
+                let p = &current[&parent];
+                let siblings: Vec<&NodePosition> = children
+                    .get(&parent)
+                    .map(|v| v.iter().filter_map(|c| current.get(c)).collect())
+                    .unwrap_or_default();
+                let mut radii: Vec<f64> = siblings.iter().map(|s| s.radius).collect();
+                radii.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                let median = radii.get(radii.len() / 2).copied().unwrap_or(1.0);
+                let mut grid = Grid::new(median * 2.0 + cfg.padding);
+                for s in &siblings {
+                    grid.insert(s.x, s.y, s.radius);
+                }
+                Self {
+                    grid,
+                    cx: p.x,
+                    cy: p.y,
+                    pad: cfg.padding,
+                    phase: phase_for(cfg.seed, parent),
+                    cursor: 0.0,
+                }
+            }
+            None => {
+                // Top-level discs (scan roots, unrelated trees) avoid every other top-level disc.
+                let mut grid = Grid::new(8.0);
+                for n in nodes {
+                    let is_top = n
+                        .parent_entity_id
+                        .map(|p| !by_id.contains_key(&p))
+                        .unwrap_or(true);
+                    if is_top {
+                        if let Some(pos) = current.get(&n.entity_id) {
+                            grid.insert(pos.x, pos.y, pos.radius);
+                        }
+                    }
+                }
+                Self {
+                    grid,
+                    cx: 0.0,
+                    cy: 0.0,
+                    pad: cfg.padding * 4.0,
+                    phase: phase_for(cfg.seed, 0),
+                    cursor: 0.0,
+                }
             }
         }
     }
-    if grid.circles.is_empty() {
-        return (0.0, 0.0);
+
+    fn place(&mut self, r: f64, cfg: &LayoutConfig) -> (f64, f64) {
+        let st = step_for(r, 0.0, cfg.padding);
+        let (x, y, d) = spiral_place(
+            &self.grid,
+            self.cx,
+            self.cy,
+            r,
+            st,
+            self.phase,
+            self.pad,
+            self.cursor,
+        );
+        self.cursor = self.cursor.max(d.max(r));
+        self.grid.insert(x, y, r);
+        (x, y)
     }
-    spiral_place(
-        &grid,
-        0.0,
-        0.0,
-        r,
-        0.0,
-        r * 1.05 + cfg.padding,
-        phase_for(cfg.seed, 0),
-        cfg.padding * 4.0,
-    )
 }
 
 /// Full re-layout on explicit user request: every unlocked node is recomputed from scratch;

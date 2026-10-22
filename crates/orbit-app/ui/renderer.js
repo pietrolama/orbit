@@ -272,7 +272,8 @@
         this.drawNodes(scene, posOf, dim);
       }
       if (search) this.drawSearchNodes(scene, posOf);
-      this.drawSatellites(scene, posOf);
+      if (scene.project) this.drawProjectLinks(scene, posOf);
+      else this.drawSatellites(scene, posOf);
     }
 
     drawBackground() {
@@ -502,6 +503,10 @@
         let alpha = n.state === "unobserved" ? 0.45 : 1;
         if (dim && !selected && !related && n.id !== scene.focus) alpha *= scene.search ? 0.12 : 0.35;
         ctx.globalAlpha = alpha;
+        // Anchor of the node's glyph, hit area and selection ring.
+        let gx = sx;
+        let gy = sy;
+        let gr = r;
         if (n.kind === "directory") {
           const rr = Math.max(1.5, r);
           ctx.strokeStyle = "rgba(140,170,230,0.55)";
@@ -511,13 +516,18 @@
           ctx.arc(sx, sy, rr, 0, Math.PI * 2);
           ctx.fill();
           if (rr > 3) ctx.stroke();
-          // Core glyph of the directory.
+          // Glyph of the directory: the centre of a large disc belongs to its largest child, so
+          // there the glyph sits on the top of the rim.
+          const onRim = rr > 20;
+          const gs = onRim ? 4 : Math.max(1.5, Math.min(rr * 0.12, 6));
+          if (onRim) gy = sy - rr;
+          gr = onRim ? 8 : Math.min(rr * 0.25, 18);
           ctx.fillStyle = "#a9c4ff";
           ctx.beginPath();
-          ctx.arc(sx, sy, Math.max(1.5, Math.min(rr * 0.12, 6)), 0, Math.PI * 2);
+          ctx.arc(gx, gy, gs, 0, Math.PI * 2);
           ctx.fill();
-          this.hitList.push({ id: n.id, sx, sy, r: Math.max(6, Math.min(rr * 0.25, 18)), dir: true });
-          if (rr > 22) this.label(n.name + "/", sx, sy - Math.min(rr * 0.12, 6) - 8, alpha, "#c9d8ff", 600, 12);
+          this.hitList.push({ id: n.id, sx: gx, sy: gy, r: Math.max(6, gr), dir: true });
+          if (rr > 22) this.label(n.name + "/", gx, gy - gs - 6, alpha, "#c9d8ff", 600, 12);
         } else {
           const rr = Math.max(0.9, r);
           ctx.fillStyle = extColor(n.ext);
@@ -534,24 +544,32 @@
         }
         if (n.pinned) {
           ctx.fillStyle = "#ffcf6e";
-          ctx.fillRect(sx + Math.max(3, r * 0.7), sy - Math.max(3, r * 0.7) - 3, 3, 3);
+          ctx.fillRect(gx + Math.max(3, gr * 0.7), gy - Math.max(3, gr * 0.7) - 3, 3, 3);
         }
         if (selected || n.id === scene.focus) {
           ctx.globalAlpha = 1;
           ctx.strokeStyle = "#ffcf6e";
           ctx.lineWidth = 2;
           ctx.beginPath();
-          ctx.arc(sx, sy, Math.max(5, (n.kind === "directory" ? Math.min(r * 0.25, 18) : r) + 4), 0, Math.PI * 2);
+          ctx.arc(gx, gy, Math.max(5, gr + 4), 0, Math.PI * 2);
           ctx.stroke();
+          if (n.kind === "directory" && r > 20) {
+            // Also outline the whole disc, which is what the selection covers.
+            ctx.globalAlpha = 0.5;
+            ctx.lineWidth = 1;
+            ctx.beginPath();
+            ctx.arc(sx, sy, r, 0, Math.PI * 2);
+            ctx.stroke();
+          }
         }
         if (scene.hover === n.id && !selected) {
           ctx.globalAlpha = 1;
           ctx.strokeStyle = "rgba(124,196,255,0.9)";
           ctx.lineWidth = 1;
           ctx.beginPath();
-          ctx.arc(sx, sy, Math.max(4, (n.kind === "directory" ? Math.min(r * 0.25, 18) : r) + 2), 0, Math.PI * 2);
+          ctx.arc(gx, gy, Math.max(4, gr + 2), 0, Math.PI * 2);
           ctx.stroke();
-          this.label(n.name, sx, sy - Math.max(8, r) - 8, 1, "#ffffff", 600, 12, true);
+          this.label(n.name, gx, gy - Math.max(8, gr) - 8, 1, "#ffffff", 600, 12, true);
         }
       }
       ctx.globalAlpha = 1;
@@ -644,6 +662,85 @@
         this.label(n.name, sx, sy + rr + 11, isResult ? 1 : 0.7, isResult ? "#ffffff" : "#b8c2da", isResult ? 600 : 400, 11);
       }
       ctx.globalAlpha = 1;
+    }
+
+    /** Project mode: each group of outside entities (another project, or a folder outside every
+     * project) is a planet on an orbit around the project's disc, kept inside the viewport, with
+     * one line per relation from the inside entity that carries it. */
+    drawProjectLinks(scene, posOf) {
+      const pv = scene.project;
+      if (!pv || !pv.groups.length || scene.search) return;
+      const ctx = this.ctx;
+      const cam = this.cam;
+      const [rx, ry] = toScreen(cam, pv.root.x, pv.root.y);
+      const rr = pv.root.r * cam.scale;
+      const orbit = rr + 70;
+      const m = 48;
+      const groups = pv.groups;
+      const hl = pv.highlight;
+      ctx.save();
+      groups.forEach((g, i) => {
+        const a = -Math.PI / 2 + (i / groups.length) * Math.PI * 2;
+        const gx = Math.min(cam.width - m, Math.max(m, rx + orbit * Math.cos(a)));
+        const gy = Math.min(cam.height - m - 40, Math.max(m + 10, ry + orbit * Math.sin(a)));
+        const lit = !hl || g.links.some((l) => l.via.some((v) => hl.has(v)));
+        const size = 7 + 2.5 * Math.sqrt(g.links.length + (g.relative ? 3 : 0));
+        // Lines from the inside entities (when loaded) to the planet.
+        for (const l of g.links) {
+          const kind = l.kinds.find((k) => k !== "name_similarity" && k !== "temporal_affinity") || l.kinds[0];
+          for (const v of l.via.slice(0, 4)) {
+            const n = scene.nodes.get(v);
+            if (!n) continue;
+            const on = !hl || hl.has(v);
+            const p = posOf(n);
+            const [sx, sy] = toScreen(cam, p.x, p.y);
+            ctx.globalAlpha = on ? 0.25 + 0.6 * l.score : 0.06;
+            ctx.strokeStyle = KIND_COLORS[kind] || "#ccc";
+            ctx.lineWidth = on && hl ? 2 : 1.2;
+            ctx.setLineDash(l.kinds.includes("explicit_reference") || l.kinds.includes("verified_duplicate") ? [] : [4, 4]);
+            ctx.beginPath();
+            ctx.moveTo(sx, sy);
+            ctx.quadraticCurveTo((sx + gx) / 2 + (gy - sy) * 0.12, (sy + gy) / 2 - (gx - sx) * 0.12, gx, gy);
+            ctx.stroke();
+          }
+        }
+        ctx.setLineDash([]);
+        const first = g.links[0];
+        const color = first ? KIND_COLORS[first.kinds.find((k) => k !== "name_similarity" && k !== "temporal_affinity") || first.kinds[0]] || "#ccc" : KIND_COLORS.project_membership;
+        if (g.relative) {
+          // Kinship: a dashed green halo and a thread to the project's disc.
+          ctx.globalAlpha = lit ? 0.5 : 0.15;
+          ctx.strokeStyle = KIND_COLORS.project_membership;
+          ctx.lineWidth = 1.5;
+          ctx.setLineDash([3, 4]);
+          ctx.beginPath();
+          ctx.moveTo(gx, gy);
+          const d = Math.hypot(gx - rx, gy - ry) || 1;
+          ctx.lineTo(rx + ((gx - rx) * Math.min(rr, d)) / d, ry + ((gy - ry) * Math.min(rr, d)) / d);
+          ctx.stroke();
+          ctx.globalAlpha = lit ? 0.9 : 0.3;
+          ctx.beginPath();
+          ctx.arc(gx, gy, size + 5, 0, Math.PI * 2);
+          ctx.stroke();
+          ctx.setLineDash([]);
+        }
+        ctx.globalAlpha = lit ? 0.95 : 0.3;
+        ctx.fillStyle = "rgba(5,7,13,0.9)";
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.arc(gx, gy, size, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.stroke();
+        this.hitList.push({ id: g.id, sx: gx, sy: gy, r: size + 4, group: g, satellite: true });
+        const name = g.is_project ? g.name : g.name + " (fuori dai progetti)";
+        const kin = g.relative
+          ? g.relative.came_first === true ? "↑ deriva da " : g.relative.came_first === false ? "↓ origine di " : "~ "
+          : "";
+        const count = g.links.length ? ` · ${g.links.length}` : "";
+        this.label(`${kin}${name}${count}`, gx, gy + size + (g.relative ? 19 : 14), lit ? 0.95 : 0.4, g.relative ? "#bff3d4" : g.is_project ? "#e6ebf7" : "#b8c2da", 600, 12, true);
+      });
+      ctx.restore();
     }
 
     drawSatellites(scene, posOf) {

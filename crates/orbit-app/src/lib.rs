@@ -49,6 +49,9 @@ const MAX_HEADER_LINE: usize = 8 * 1024;
 const MAX_HEADERS: usize = 64;
 const MAX_CONNECTIONS: usize = 64;
 const MAX_POSITIONS_PER_SAVE: usize = 10_000;
+/// Default threshold of project mode: keeps references, duplicates, fingerprints and strong name
+/// genealogy; hides temporal proximity alone and weak name similarity.
+const PROJECT_MIN_SCORE: f64 = 0.4;
 
 const UI_INDEX_HTML: &str = include_str!("../ui/index.html");
 const UI_APP_JS: &str = include_str!("../ui/app.js");
@@ -825,7 +828,22 @@ fn api(req: &Request, state: &AppState) -> Response {
             let g = state.graph();
             let mc = req.query_i64("max_clusters").unwrap_or(300).clamp(1, 2000) as usize;
             let mf = req.query_i64("max_flows").unwrap_or(200).clamp(0, 5000) as usize;
-            Response::ok(&g.overview(mc, mf))
+            Response::ok(&g.overview_within(mc, mf, req.query_i64("within")))
+        }
+        ("GET", "/api/projects") => {
+            let min = req.query_f64("min_score").unwrap_or(PROJECT_MIN_SCORE);
+            Response::ok(&state.graph().projects(min.clamp(0.0, 1.0)))
+        }
+        ("GET", "/api/graph/project") => {
+            let Some(id) = req.query_i64("id") else {
+                return Response::error(400, "parametro id obbligatorio");
+            };
+            let min = req.query_f64("min_score").unwrap_or(PROJECT_MIN_SCORE);
+            let limit = req.query_i64("limit").unwrap_or(80).clamp(1, 1000) as usize;
+            match state.graph().project_view(id, min.clamp(0.0, 1.0), limit) {
+                Some(v) => Response::ok(&v),
+                None => Response::error(404, "entità non trovata o senza posizione"),
+            }
         }
         ("GET", "/api/graph/region") => {
             let (Some(x0), Some(y0), Some(x1), Some(y1), Some(scale)) = (
@@ -843,6 +861,7 @@ fn api(req: &Request, state: &AppState) -> Response {
                     .collect::<Vec<_>>()
             });
             let q = RegionQuery {
+                within: req.query_i64("within"),
                 x0,
                 y0,
                 x1,

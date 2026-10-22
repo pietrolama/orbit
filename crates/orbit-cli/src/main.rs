@@ -29,7 +29,8 @@ Comandi:
       --follow-symlinks        Segue i link simbolici
       --cross-mounts           Attraversa altri filesystem
       --exclude <PERCORSO>     Esclude un percorso assoluto (ripetibile)
-      --no-default-excludes    Non esclude /proc, /sys, /dev, /run
+      --no-default-excludes    Non esclude /proc, /sys, /dev, /run né le directory di dipendenze,
+                               cache e build (.git, node_modules, .venv, target, ...)
       --verify-duplicates      Calcola l'hash completo dei candidati duplicati
       --no-relations           Registra solo lo snapshot
   refresh [--verify-duplicates] Ricalcola fingerprint, relazioni e layout senza scansionare
@@ -282,6 +283,7 @@ fn cmd_scan(store: &OrbitStore, args: &mut Args) -> Result<(), String> {
     cfg.cross_mounts = cross;
     if no_default {
         cfg.excluded_paths.clear();
+        cfg.excluded_names.clear();
     }
     for e in excludes {
         let p = PathBuf::from(&e);

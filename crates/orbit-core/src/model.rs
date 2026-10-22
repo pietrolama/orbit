@@ -89,6 +89,13 @@ pub struct ScanConfig {
     /// `/proc`, `/sys`, `/dev` and `/run` (see [`ScanConfig::default_excluded_paths`]).
     #[serde(default = "ScanConfig::default_excluded_paths")]
     pub excluded_paths: Vec<PathBuf>,
+    /// Directory names that are never traversed wherever they appear: dependency, VCS and build
+    /// directories that would drown a project's own files (recorded like `excluded_paths`).
+    /// `target` is only excluded next to a `Cargo.toml`, and while this list is non-empty any
+    /// directory holding a `pyvenv.cfg` (a Python virtualenv) is excluded too. See
+    /// [`ScanConfig::default_excluded_names`].
+    #[serde(default = "ScanConfig::default_excluded_names")]
+    pub excluded_names: Vec<String>,
 }
 
 impl ScanConfig {
@@ -100,6 +107,7 @@ impl ScanConfig {
             cross_mounts: false,
             progress_interval_ms: 75,
             excluded_paths: Self::default_excluded_paths(),
+            excluded_names: Self::default_excluded_names(),
         }
     }
 
@@ -110,6 +118,32 @@ impl ScanConfig {
             .iter()
             .map(PathBuf::from)
             .collect()
+    }
+
+    /// Default name exclusions: version control, dependency, virtualenv, tool cache and build
+    /// output directories.
+    pub fn default_excluded_names() -> Vec<String> {
+        [
+            ".git",
+            ".hg",
+            ".svn",
+            "node_modules",
+            ".venv",
+            "venv",
+            "__pycache__",
+            ".mypy_cache",
+            ".pytest_cache",
+            ".ruff_cache",
+            ".tox",
+            ".gradle",
+            ".next",
+            ".nuxt",
+            ".flatpak-builder",
+            "target",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
     }
 }
 

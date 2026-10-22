@@ -12,6 +12,7 @@
       <span class="brand-mark" aria-hidden="true"></span>ORBIT
     </div>
     <nav class="modes" role="tablist" aria-label="Modalità">
+      <button role="tab" data-mode="projects" aria-selected="false">Progetti</button>
       <button role="tab" data-mode="explore" class="active" aria-selected="true">Explore</button>
       <button role="tab" data-mode="history" aria-selected="false">History</button>
       <button role="tab" data-mode="recover" aria-selected="false">Recover</button>
@@ -33,7 +34,7 @@
 
     <div id="empty" class="overlay-msg hidden">
       <h2>Nessuno spazio ancora</h2>
-      <p>Scegli una cartella in alto e premi <b>Scansiona</b>. ORBIT legge solo metadati e piccoli campioni, in locale.</p>
+      <p>Scegli in alto la cartella che contiene i tuoi progetti (es. <code>~/projects</code>) e premi <b>Scansiona</b>. ORBIT legge solo metadati e piccoli campioni, in locale; dipendenze, virtualenv, <code>.git</code> e cartelle di build vengono saltate.</p>
     </div>
 
     <div id="hud">
